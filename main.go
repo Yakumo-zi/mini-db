@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"os"
 )
 
 type Key []byte
@@ -57,6 +58,7 @@ func (m MiniDB) Records() []Record {
 			Value:       v,
 		}
 		record := Record{
+			Length:  uint32(4 + 4 + 1 + 4 + len(k) + 4 + len(v)),
 			Payload: payload,
 		}
 		records = append(records, record)
@@ -78,7 +80,7 @@ func PayloadFromBytes(bs []byte) Payload {
 	payload.Key = make(Key, payload.KeyLength)
 	binary.Read(reader, binary.BigEndian, payload.Key)
 	binary.Read(reader, binary.BigEndian, &payload.ValueLength)
-	payload.Value = make(Value, payload.KeyLength)
+	payload.Value = make(Value, payload.ValueLength)
 	binary.Read(reader, binary.BigEndian, payload.Value)
 	return payload
 }
@@ -103,29 +105,84 @@ type Record struct {
 	Payload Payload
 }
 
-func RecordToBytes(r Record) []byte {
+func RecordToBytes(r Record) ([]byte, error) {
 	buffer := bytes.NewBuffer(make([]byte, 0, 128))
-	binary.Write(buffer, binary.BigEndian, uint32(4+4+1+r.Payload.Length()))
+	err := binary.Write(buffer, binary.BigEndian, r.Length)
+	if err != nil {
+		return nil, err
+	}
 	pbs := r.Payload.Bytes()
 	r.CRC = crc32.ChecksumIEEE(pbs)
-	fmt.Printf("crc=%d\n", r.CRC)
-	binary.Write(buffer, binary.BigEndian, r.CRC)
-	binary.Write(buffer, binary.BigEndian, r.Flags)
-	buffer.Write(pbs)
-	return buffer.Bytes()
+	err = binary.Write(buffer, binary.BigEndian, r.CRC)
+	if err != nil {
+		return nil, err
+	}
+	err = binary.Write(buffer, binary.BigEndian, r.Flags)
+	if err != nil {
+		return nil, err
+	}
+	_, err = buffer.Write(pbs)
+	if err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
 }
 
-func RecordFromBytes(bs []byte) Record {
+func RecordFromBytes(bs []byte) (record Record, err error) {
 	reader := bytes.NewReader(bs)
-	record := Record{}
-	binary.Read(reader, binary.BigEndian, &record.Length)
-	binary.Read(reader, binary.BigEndian, &record.CRC)
-	binary.Read(reader, binary.BigEndian, &record.Flags)
+	err = binary.Read(reader, binary.BigEndian, &record.Length)
+	err = binary.Read(reader, binary.BigEndian, &record.CRC)
+	err = binary.Read(reader, binary.BigEndian, &record.Flags)
 	buf := make([]byte, reader.Len())
 	_, _ = io.ReadFull(reader, buf)
 	payload := PayloadFromBytes(buf)
 	record.Payload = payload
-	return record
+	return record, err
+}
+
+func StoreRecordToFile(file *os.File, record Record) error {
+	bs, err := RecordToBytes(record)
+	if err != nil {
+		return err
+	}
+	_, err = file.Write(bs)
+	return err
+}
+
+func LoadRecordsFromFile(file *os.File) ([]Record, error) {
+	records := make([]Record, 0, 10)
+	var err error
+	for {
+		var length uint32
+		err = binary.Read(file, binary.BigEndian, &length)
+		if err != nil {
+			fmt.Printf("load length\n")
+			break
+		}
+		bs := make([]byte, length-4)
+		err = binary.Read(file, binary.BigEndian, bs)
+		if err != nil {
+			fmt.Printf("load record,%d\n", length)
+			break
+		}
+		lbs := make([]byte, 4)
+		_, err = binary.Encode(lbs, binary.BigEndian, length)
+		if err != nil {
+			fmt.Printf("encode length\n")
+			break
+		}
+		bs = append(lbs, bs...)
+		record, err := RecordFromBytes(bs)
+		if err != nil {
+			fmt.Printf("parse\n")
+			break
+		}
+		records = append(records, record)
+	}
+	if err != io.EOF {
+		return nil, err
+	}
+	return records, nil
 }
 
 func main() {
@@ -134,11 +191,38 @@ func main() {
 
 func DBTest() {
 	db := MiniDB{}
+	dwf, err := os.OpenFile("./data.db", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		fmt.Printf("%s", err)
+		return
+	}
+	defer dwf.Close()
 	for n := range 5 {
 		key := Key(fmt.Sprintf("key%d", n))
 		value := Value(fmt.Sprintf("value%d", n))
 		db.Put(key, value)
 	}
 	records := db.Records()
-	fmt.Printf("%+v\n", records)
+	for _, record := range records {
+		err = StoreRecordToFile(dwf, record)
+		if err != nil {
+			fmt.Printf("%s\n", err)
+			break
+		}
+	}
+	if err = dwf.Sync(); err != nil {
+		fmt.Printf("%s\n", err)
+	}
+	drf, err := os.OpenFile("./data.db", os.O_RDONLY, 0o644)
+	if err != nil {
+		fmt.Printf("%s\n", err)
+		return
+	}
+	defer drf.Close()
+	records, err = LoadRecordsFromFile(drf)
+	if err != nil {
+		fmt.Printf("%s\n", err)
+		return
+	}
+	fmt.Printf("records:\n%+v\n", records)
 }
